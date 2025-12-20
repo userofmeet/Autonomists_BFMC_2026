@@ -38,7 +38,7 @@ pip install mbed-tools
 # Install formatting tools for build output
 pip install prettytable intelhex
 
-# 🏗️ Building and Flashing
+## 🏗️ Building and Flashing
 
 This module focuses on the transition from source code to hardware execution. It is a critical part of the **Embedded Platform** development workflow for the BFMC competition.
 
