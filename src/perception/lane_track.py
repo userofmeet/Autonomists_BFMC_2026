@@ -3,133 +3,120 @@ import numpy as np
 import math
 from collections import deque
 
-# --- Stabilizers ---
+# --- Global Buffers & State ---
 lane_buffer = deque(maxlen=5)
-angle_buffer = deque(maxlen=10)
+angle_buffer = deque(maxlen=25) 
+current_canny_low = 50
+current_canny_high = 150
 
-def detect_pencil_lanes(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+# --- Calibrated ROI Constants ---
+LANE_ROI = [262, 480, 0, 640]
+HAZARD_ROI = [117, 304, 72, 568]
+SEMAPHORE_ROI = [174, 480, 320, 640]
+SIGNAL_ROI = [0, 305, 321, 640]
+
+def closed_loop_edge_detection(roi_frame):
+    global current_canny_low, current_canny_high
+    
+    gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    # Adaptive Thresholding handles varying office light
+    
+    # Adaptive Thresholding for varying light
     thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 11, 2)
-    kernel = np.ones((3,3), np.uint8)
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-    edges = cv2.Canny(opening, 50, 150)
+    
+    # Dynamic Canny Adjustment
+    edges = cv2.Canny(thresh, current_canny_low, current_canny_high)
+    edge_density = np.sum(edges == 255) / edges.size
+    
+    # Autocorrection Logic
+    if edge_density > 0.03: 
+        current_canny_low += 2
+        current_canny_high += 2
+    elif edge_density < 0.01:
+        current_canny_low -= 2
+        current_canny_high -= 2
+        
+    current_canny_low = np.clip(current_canny_low, 10, 100)
+    current_canny_high = np.clip(current_canny_high, 100, 250)
     return edges
 
-def region_of_interest(edges):
-    height, width = edges.shape
-    mask = np.zeros_like(edges)
-    # Focus on the lower 60% of the screen
-    polygon = np.array([[(0, height), (0, int(height * 0.4)), 
-                         (width, int(height * 0.4)), (width, height)]], np.int32)
-    cv2.fillPoly(mask, polygon, 255)
-    return cv2.bitwise_and(edges, mask)
-
-def make_points(frame, line):
-    height, _, _ = frame.shape
-    slope, intercept = line
-    y1 = height
-    y2 = int(y1 * 0.6)
-    # Prevent division by zero
-    if slope == 0: slope = 0.001
-    x1 = int((y1 - intercept) / slope)
-    x2 = int((y2 - intercept) / slope)
-    return [[x1, y1, x2, y2]]
-
-def average_slope_intercept(frame, line_segments):
-    if line_segments is None: 
+def average_slope_intercept(lines, y_offset):
+    if lines is None: 
         return list(lane_buffer)[-1] if lane_buffer else []
 
-    height, width, _ = frame.shape
     left_fit, right_fit = [], []
-    midline = width / 2
-
-    for line_segment in line_segments:
-        for x1, y1, x2, y2 in line_segment:
-            if x1 == x2: continue
-            fit = np.polyfit((x1, x2), (y1, y2), 1)
-            slope, intercept = fit[0], fit[1]
-            
-            if slope < -0.3:
-                left_fit.append((slope, intercept))
-            elif slope > 0.3:
-                right_fit.append((slope, intercept))
-
-    current_lanes = []
-    if len(left_fit) > 0:
-        current_lanes.append(make_points(frame, np.average(left_fit, axis=0)))
-    if len(right_fit) > 0:
-        current_lanes.append(make_points(frame, np.average(right_fit, axis=0)))
-    
-    if current_lanes:
-        lane_buffer.append(current_lanes)
-    return current_lanes
-
-def get_steering_angle(frame, lane_lines):
-    height, width, _ = frame.shape
-    if len(lane_lines) == 2:
-        _, _, left_x2, _ = lane_lines[0][0]
-        _, _, right_x2, _ = lane_lines[1][0]
-        x_offset = (left_x2 + right_x2) / 2 - (width / 2)
-    elif len(lane_lines) == 1:
-        x1, _, x2, _ = lane_lines[0][0]
-        x_offset = x2 - x1
-    else:
-        x_offset = 0
-    
-    y_offset = height / 2
-    angle_to_mid_deg = math.degrees(math.atan(x_offset / y_offset))
-    return angle_to_mid_deg + 90
-
-def get_stabilized_steering(new_angle):
-    angle_buffer.append(new_angle)
-    return sum(angle_buffer) / len(angle_buffer)
-
-def display_everything(frame, steering_angle, lane_lines):
-    line_image = np.zeros_like(frame)
-    for line in lane_lines:
+    for line in lines:
         for x1, y1, x2, y2 in line:
-            cv2.line(line_image, (x1, y1), (x2, y2), (0, 255, 0), 10)
-    
-    angle_rad = math.radians(steering_angle)
-    x1, y1 = int(frame.shape[1] / 2), frame.shape[0]
-    
-    # Safe tan calculation to avoid ZeroDivision
-    tan_val = math.tan(angle_rad)
-    if abs(tan_val) < 0.001: tan_val = 0.001
-    
-    x2 = int(x1 - (frame.shape[0]/2) / tan_val)
-    y2 = int(frame.shape[0] / 2)
-    cv2.line(line_image, (x1, y1), (x2, y2), (0, 0, 255), 5)
-    return cv2.addWeighted(frame, 0.8, line_image, 1, 1)
+            if x1 == x2: continue
+            fit = np.polyfit((x1, x2), (y1 + y_offset, y2 + y_offset), 1)
+            slope, intercept = fit[0], fit[1]
+            if slope < -0.3: left_fit.append((slope, intercept))
+            elif slope > 0.3: right_fit.append((slope, intercept))
 
-# --- Execution ---
-video = cv2.VideoCapture(0)
+    def make_pts(slope, intercept):
+        y1, y2 = 480, 320
+        x1 = int((y1 - intercept) / slope)
+        x2 = int((y2 - intercept) / slope)
+        return [[x1, y1, x2, y2]]
 
+    lanes = []
+    if left_fit: lanes.append(make_pts(*np.average(left_fit, axis=0)))
+    if right_fit: lanes.append(make_pts(*np.average(right_fit, axis=0)))
+    if lanes: lane_buffer.append(lanes)
+    return lanes
+
+def draw_hud(frame, lanes, steer_angle, x_offset):
+    hud = frame.copy()
+    
+    # Draw ROIs
+    cv2.rectangle(hud, (0, 262), (640, 480), (0, 255, 0), 2)       
+    cv2.rectangle(hud, (72, 117), (568, 304), (0, 255, 255), 2)   
+    cv2.rectangle(hud, (320, 174), (640, 480), (0, 0, 255), 2)    
+    cv2.rectangle(hud, (321, 0), (640, 305), (255, 0, 0), 2)      
+
+    # Dynamic Offset Line
+    origin_x, origin_y = 320, 480
+    target_x = 320 + x_offset
+    cv2.line(hud, (origin_x, origin_y), (int(target_x), 300), (0, 0, 255), 4)
+
+    # Lane Overlays
+    for line in lanes:
+        for x1, y1, x2, y2 in line:
+            cv2.line(hud, (x1, y1), (x2, y2), (0, 255, 0), 5)
+            
+    cv2.putText(hud, f"STEER: {steer_angle-90:.1f}deg", (10, 40), 1, 1.5, (0,0,255), 2)
+    return hud
+
+# --- Main Execution ---
+cap = cv2.VideoCapture(0)
 while True:
-    ret, frame = video.read()
+    ret, img = cap.read()
     if not ret: break
+    img = cv2.resize(img, (640, 480))
     
-    # Processing pipeline
-    edges = detect_pencil_lanes(frame)
-    roi = region_of_interest(edges)
+    # ROI Slicing
+    lane_slice = img[LANE_ROI[0]:LANE_ROI[1], LANE_ROI[2]:LANE_ROI[3]]
+    edges = closed_loop_edge_detection(lane_slice)
     
-    line_segments = cv2.HoughLinesP(roi, 1, np.pi/180, 40, np.array([]), 
-                                    minLineLength=30, maxLineGap=100)
+    # Detection
+    line_segs = cv2.HoughLinesP(edges, 1, np.pi/180, 40, minLineLength=30, maxLineGap=100)
+    lanes = average_slope_intercept(line_segs, LANE_ROI[0])
     
-    lane_lines = average_slope_intercept(frame, line_segments)
-    
-    raw_angle = get_steering_angle(frame, lane_lines)
-    smooth_angle = get_stabilized_steering(raw_angle)
-    
-    output = display_everything(frame, smooth_angle, lane_lines)
+    # Math
+    x_offset = 0
+    if len(lanes) == 2:
+        x_offset = (lanes[0][0][2] + lanes[1][0][2]) / 2 - 320
+    elif len(lanes) == 1:
+        x_offset = lanes[0][0][2] - lanes[0][0][0]
 
-    cv2.imshow("Stark HUD - Lab Mode", output)
-    
-    if cv2.waitKey(1) & 0xFF == 27: # Press ESC to close
-        break
+    raw_angle = math.degrees(math.atan(x_offset / 240)) + 90
+    angle_buffer.append(raw_angle)
+    smooth_angle = sum(angle_buffer) / len(angle_buffer)
 
-video.release()
+    cv2.imshow("Autonomists - Final Integrated Engine", draw_hud(img, lanes, smooth_angle, x_offset))
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
 cv2.destroyAllWindows()
