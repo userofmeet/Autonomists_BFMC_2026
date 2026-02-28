@@ -100,7 +100,7 @@ State transitions are driven by distance measurements, yaw angle changes, and en
 ### Command Input
 
 - Interface: UART with DMA
-- Format:  **S<speed>A<angle>**
+- Format:  **S&lt;speed&gt;A&lt;angle&gt;**
 
 - Where:
 - `speed` is the target vehicle speed in mm/s
