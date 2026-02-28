@@ -26,8 +26,9 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
 typedef struct {
-    float Kp, Ki, Kd;
+    float Kp, Ki, Kd, Kf;
     float error_prev;
     float integral;
 } PID_TypeDef;
@@ -39,6 +40,7 @@ typedef enum {
     PARK_REVERSING,
     PARK_FINISHED
 } ParkingState;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -65,6 +67,11 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+float current_setpoint = 0;
+#define ACCEL_STEP 2.5f
+
+uint32_t blinker_tick = 0;
+
 uint8_t rpi_rx_buffer[9];
 uint32_t last_rpi_tick = 0;
 uint8_t us100_buffer[2];
@@ -74,7 +81,7 @@ int32_t encoder_count = 9;
 float target_speed = 0;
 float target_angle = 0;
 
-PID_TypeDef motorPID = {1.2f, 0.5f, 0.01f}; // Initial tuning
+PID_TypeDef motorPID = {1.2f, 0.5f, 0.01f, 1500.0f};
 ParkingState current_park_state = PARK_IDLE;
 
 float actual_speed = 0;
@@ -82,6 +89,7 @@ uint32_t servo_pwm = 1500; // 1500 is center
 uint32_t motor_pwm = 1500; // Neutral
 
 float current_yaw = 0.0f;
+float start_yaw = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -104,26 +112,24 @@ float get_distance_mm() {
     return (ticks / 330.0f) * 204.2f; //circumference of wheel
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if(huart->Instance == USART1) {
-    	rpi_rx_buffer[8] = '\0';
-        // Simple Parser: Look for 'S' for speed and 'A' for angle
-        sscanf((char*)rpi_rx_buffer, "S%fA%f", &target_speed, &target_angle);
-        last_rpi_tick = HAL_GetTick();
-        HAL_UART_Receive_DMA(&huart1, rpi_rx_buffer, 8);
-    }
-}
-
 float ComputePID(float target, float actual, PID_TypeDef *pid) {
     float error = target - actual;
-    pid->integral += error * 0.01f; // 0.01s = 10ms
+    pid->integral += error * 0.01f;
+    
+    // Anti-windup: Stop integral from growing too large if car is stuck
+    if(pid->integral > 500) pid->integral = 500;
+    if(pid->integral < -500) pid->integral = -500;
+
     float derivative = (error - pid->error_prev) / 0.01f;
-    float output = (pid->Kp * error) + (pid->Ki * pid->integral) + (pid->Kd * derivative);
+    
+    // Output = FeedForward + PID terms
+    float output = pid->Kf + (pid->Kp * error) + (pid->Ki * pid->integral) + (pid->Kd * derivative);
     pid->error_prev = error;
 
-    // Safety clamp (Assume TIM1 ARR is 19999)
+    // ESC Safety Clamps (Standard RC range is 1000us to 2000us)
     if(output > 2000) output = 2000;
     if(output < 1000) output = 1000;
+    
     return output;
 }
 
@@ -198,62 +204,84 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
-  {
-	  Read_BNO055_Yaw();
-      uint8_t trigger = 0x55;
-      HAL_UART_Transmit(&huart2, &trigger, 1, 10);
+    {
+        /* 1. SENSOR UPDATES (Orientation) */
+        Read_BNO055_Yaw();
 
-      if(HAL_UART_Receive(&huart2, us100_buffer, 2, 50) == HAL_OK) {
-          distance_mm = (us100_buffer[0] << 8) | us100_buffer[1];
-      }
+        /* 2. ULTRASONIC TRIGGER (Non-Blocking) */
+        // We trigger the US-100 every 100ms. 
+        // The result is handled automatically by HAL_UART_RxCpltCallback.
+        static uint32_t last_us_trigger = 0;
+        if(HAL_GetTick() - last_us_trigger > 100) {
+            uint8_t trigger = 0x55;
+            HAL_UART_Transmit(&huart2, &trigger, 1, 10);
+            HAL_UART_Receive_IT(&huart2, us100_buffer, 2); 
+            last_us_trigger = HAL_GetTick();
+        }
 
-      switch (current_park_state) {
-          case PARK_IDLE:
-              // Wait for RPi to send a "Start Park" command
-              break;
+        /* 3. BFMC PARKING STATE MACHINE */
+        switch (current_park_state) {
+            case PARK_IDLE:
+                // Standing by for RPi command to start searching
+                break;
 
-          case PARK_SEARCHING:
-              target_speed = 100.0f; // Drive slowly searching for a gap
-              if (distance_mm > 500) { // If side sensor sees a big gap
-                  encoder_count = 0;   // Reset odometry
-                  current_park_state = PARK_POSITIONING;
-              }
-              break;
+            case PARK_SEARCHING:
+                target_speed = 100.0f; // Drive slowly at 100mm/s
+                target_angle = 0;      // Keep wheels straight
+                
+                // If the side sensor sees a gap larger than 500mm
+                if (distance_mm > 500) { 
+                    __HAL_TIM_SET_COUNTER(&htim2, 0); // Reset Odometry
+                    current_park_state = PARK_POSITIONING;
+                }
+                break;
 
-          case PARK_POSITIONING:
-              // Drive forward until we are exactly past the spot
-              if (get_distance_mm() > 300.0f) { // 300mm = distance to clear the spot
-                  target_speed = 0;
-                  HAL_Delay(500);
-                  current_park_state = PARK_REVERSING;
-              }
-              break;
+            case PARK_POSITIONING:
+                // Drive forward until we clear the parking spot (approx 300mm)
+                if (get_distance_mm() > 300.0f) { 
+                    target_speed = 0;
+                    start_yaw = current_yaw;
+                    HAL_Delay(500); // Brief pause to settle
+                    current_park_state = PARK_REVERSING;
+                }
+                break;
 
-          case PARK_REVERSING:
-              target_angle = -30.0f; // Hard right
-              target_speed = -100.0f; // Reverse
-              // Use BNO055 to stop when we hit a 45-degree angle
-              if (current_yaw >= 45.0f) {
-                  target_angle = 30.0f; // Hard left to straighten out
-                  current_park_state = PARK_FINISHED;
-              }
-              break;
+            case PARK_REVERSING:
+                target_angle = -30.0f;  // Hard steer into the spot
+                target_speed = -100.0f; // Reverse slowly
+                
+                // Calculate relative turn angle (handling 360 wrap-around)
+                float turned = current_yaw - start_yaw;
+                if (turned > 180)  turned -= 360; 
+                if (turned < -180) turned += 360;
 
-          case PARK_FINISHED:
-              target_speed = 0;
-              target_angle = 0; // Center wheels
-              break;
-      }
-      Send_Telemetry();
-      HAL_Delay(50);
-    /* USER CODE END WHILE */
+                // Stop once the car has rotated 45 degrees
+                if (turned >= 45.0f || turned <= -45.0f) { 
+                    current_park_state = PARK_FINISHED;
+                }
+                break;
 
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+            case PARK_FINISHED:
+                target_speed = 0;
+                target_angle = 0; // Straighten wheels
+                break;
+        }
+
+        /* 4. DATA FEEDBACK */
+        // Send Speed, Yaw, and Distance back to Raspberry Pi for processing
+        Send_Telemetry();
+
+        /* 5. LOOP STABILITY */
+        // A small delay to keep the loop from hogging 100% CPU, 
+        // allowing the interrupts (DMA/Timers) to breathe.
+        HAL_Delay(10);
+
+      /* USER CODE END WHILE */
+
+      /* USER CODE BEGIN 3 */
+    }
+    /* USER CODE END 3 */
 }
 
 /**
@@ -607,34 +635,56 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM4) {
-        // 1. Calculate how fast we are actually moving
+        
+        // A. Speed Ramping (Anti-Jerk)
+        if (current_setpoint < target_speed) current_setpoint += ACCEL_STEP;
+        else if (current_setpoint > target_speed) current_setpoint -= ACCEL_STEP;
+
+        // B. Odometry (Encoder Calculation)
         int16_t ticks = (int16_t)__HAL_TIM_GET_COUNTER(&htim2);
-        __HAL_TIM_SET_COUNTER(&htim2, 0); // Reset for the next 10ms window
+        __HAL_TIM_SET_COUNTER(&htim2, 0);
+        actual_speed = (ticks / 330.0f) * 204.2f * 100.0f;
 
-        // Convert ticks to mm/s (330 ticks per rev, 204.2mm circumference)
-        actual_speed = (ticks / 330.0f) * 204.2f * 100.0f; // *100 to get per second
+        // C. BFMC Safety Stop
+        if (distance_mm < 150 && target_speed > 0) {
+            target_speed = 0; 
+            current_setpoint = 0; // Immediate override
+        }
 
-        // 2. PID Control for Motor
-        if (target_speed != 0) {
-            motor_pwm = (uint32_t)ComputePID(target_speed, actual_speed, &motorPID);
+        // D. PID Motor Control
+        if (target_speed != 0 || actual_speed > 5) {
+            motor_pwm = (uint32_t)ComputePID(current_setpoint, actual_speed, &motorPID);
         } else {
-            motor_pwm = 1500; // Neutral/Stop
-            motorPID.integral = 0; // Reset integral so it doesn't "wind up" while stopped
+            motor_pwm = 1500; // Hard neutral
+            motorPID.integral = 0;
         }
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, motor_pwm);
 
-        // 3. Servo Steering
-        // Maps target_angle (-30 to +30) to PWM (approx 1000 to 2000)
-        servo_pwm = 1500 + (target_angle * 16.6f);
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, servo_pwm);
-
-        // 4. Safety: RPi Watchdog
-        if (HAL_GetTick() - last_rpi_tick < 500) {
-            // Run Parking State Machine here
-        } else {
-            current_park_state = PARK_IDLE; // Reset if we lose signal
-            target_speed = 0;
+        // E. Servo & BFMC Signaling (Blinkers/Brakes)
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 1500 + (target_angle * 16.6f));
+        
+        blinker_tick++;
+        if ((blinker_tick % 25) == 0) { // Every 250ms
+            if (target_angle > 15.0f) HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1); // Right Signal
+            if (target_angle < -15.0f) HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2); // Left Signal
         }
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if(huart->Instance == USART1) { // Data from Raspberry Pi
+        // Ensure the buffer is a valid C-string for sscanf
+        rpi_rx_buffer[8] = '\0';
+
+        // THE MISSING PIECE: Actually update the targets!
+        sscanf((char*)rpi_rx_buffer, "S%fA%f", &target_speed, &target_angle);
+
+        last_rpi_tick = HAL_GetTick();
+        HAL_UART_Receive_DMA(&huart1, rpi_rx_buffer, 8); // Restart DMA
+    }
+    
+    if(huart->Instance == USART2) { // Data from US-100
+        distance_mm = (us100_buffer[0] << 8) | us100_buffer[1];
     }
 }
 /* USER CODE END 4 */
