@@ -99,13 +99,12 @@ State transitions are driven by distance measurements, yaw angle changes, and en
 
 ### Command Input
 
-- Interface: UART with DMA
-- Format:  **S&lt;speed&gt;A&lt;angle&gt;**
+- **Interface:** UART with DMA  
+- **Command Format:** `S<speed>A<angle>`
 
-- Where:
-- `speed` is the target vehicle speed in mm/s
-- `angle` is the steering angle in degrees
-
+**Parameters:**
+- `speed` — Target vehicle speed in millimeters per second (mm/s)  
+- `angle` — Steering angle in degrees
 ### Telemetry Output
 
 The firmware periodically transmits telemetry data over UART, including:
