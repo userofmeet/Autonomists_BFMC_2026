@@ -9,6 +9,7 @@ High-level commands and monitoring are handled externally with Raspberry Pi 5, w
 ---
 
 ## System Architecture
+<img width="1752" height="747" alt="image" src="https://github.com/user-attachments/assets/31b69a99-0453-4855-9104-da0f539a592b" />
 
 The firmware is structured around the following functional layers:
 
